@@ -1,57 +1,72 @@
-//
-// Created by victoryang00 on 4/4/23.
-//
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <signal.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <linux/perf_event.h>
-#include <sys/time.h>
 #include <asm/unistd.h>
 
-#define PMI_VECTOR 0xF0 // 假设你使用了中断向量0xF0
+#define INSTRUCTIONS_THRESHOLD 1000000
 
-unsigned long long last_tsc = 0;
-unsigned long long instruction_count = 0;
-unsigned long long pid_count = 0;
-
-static void pmi_handler(int sig, siginfo_t *info, void *context) {
-  unsigned long long current_tsc;
-  __asm__ volatile("rdtsc" : "=A" (current_tsc));
-  instruction_count += current_tsc - last_tsc;
-  last_tsc = current_tsc;
-  
-  if (instruction_count >= 1000000) {
-    instruction_count -= 1000000;
-    pid_count++;
-    printf("PID %d instruction count: %llu\n", getpid(), pid_count);
-  }
+static int perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
+                           int cpu, int group_fd, unsigned long flags)
+{
+    int ret = syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+    return ret;
 }
 
-int main(int argc, char *argv[]) {
-  struct sigaction sa;
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
-  // 设置PMI handler
-  sa.sa_sigaction = pmi_handler;
-  sa.sa_flags = SA_SIGINFO;
-  sigemptyset(&sa.sa_mask);
-  sigaction(PMI_VECTOR, &sa, NULL);
+static void event_overflow_callback(int signum)
+{
+    uint64_t rdtsc_value = rdtsc();
+    printf("PMI Handler: RDTSC value is %llu\n", rdtsc_value);
+}
 
-  // 设置性能计数器
-  unsigned long long event = (PERF_COUNT_HW_INSTRUCTIONS << 0) |
-                             (PERF_COUNT_HW_CPU_CYCLES << 8);
-  unsigned long long umask = 0x00;
-  unsigned long long config = event | (umask << 8);
-  unsigned long long period = 1000000; // 1 million instructions
-  int fd = syscall(__NR_perf_event_open, &config, 0, -1, -1, 0);
-  ioctl(fd, PERF_EVENT_IOC_PERIOD, &period);
+int main(int argc, char **argv)
+{
+    struct perf_event_attr pe;
+    int fd;
 
-  // 让程序执行一些指令
-  for (int i = 0; i < 10000000000; i++) {
-    // 执行一些指令
-    __asm__ volatile("nop");
-  }
+    memset(&pe, 0, sizeof(struct perf_event_attr));
+    pe.type = PERF_TYPE_HARDWARE;
+    pe.size = sizeof(struct perf_event_attr);
+    pe.config = PERF_COUNT_HW_INSTRUCTIONS;
+    pe.sample_period = INSTRUCTIONS_THRESHOLD;
+    pe.disabled = 1;
+    pe.exclude_kernel = 1;
+    pe.exclude_hv = 1;
 
-  return 0;
+    fd = perf_event_open(&pe, 0, -1, -1, 0);
+    if (fd == -1)
+    {
+        perror("Error in perf_event_open");
+        exit(EXIT_FAILURE);
+    }
+
+    signal(SIGIO, event_overflow_callback);
+    fcntl(fd, F_SETFL, O_ASYNC);
+    fcntl(fd, F_SETOWN, getpid());
+    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(fd, PERF_EVENT_IOC_REFRESH, 1);
+
+    while (1)
+    {
+        // 在这里执行您要监控的代码或任务
+        asm volatile("nop");
+    }
+
+    close(fd);
+    return 0;
 }
